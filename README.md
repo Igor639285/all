@@ -60,3 +60,5 @@ pip install -r requirements.txt
 ```bash
 python bot.py
 ```
+
+Если зависимость или токен не настроены, бот теперь завершится без Python traceback и выведет понятную ошибку в лог.

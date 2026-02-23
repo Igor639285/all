@@ -262,17 +262,16 @@ def main() -> None:
     ensure_config_files()
 
     if importlib.util.find_spec("telegram") is None:
-        raise RuntimeError(
-            "Не найден пакет 'python-telegram-bot'. Установите зависимости командой: "
-            "pip install -r requirements.txt"
-        )
+        logging.error("Не найден пакет 'python-telegram-bot'. Установите зависимости: pip install -r requirements.txt")
+        return
 
     from telegram import Update
     from telegram.ext import Application, MessageHandler, filters
 
     token = load_token(TOKEN_PATH)
     if token == "PASTE_TELEGRAM_BOT_TOKEN_HERE":
-        raise RuntimeError("Укажите токен в token.txt перед запуском.")
+        logging.error("Укажите токен в token.txt перед запуском.")
+        return
 
     messages = load_messages(MESSAGES_PATH)
     storage = RespectStorage(DB_PATH)
