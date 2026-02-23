@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import random
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict
 
@@ -21,13 +22,15 @@ MESSAGES_PATH = Path("messages.txt")
 DEFAULT_MESSAGES = {
     "all_empty": "В группе пока некому отправить упоминание.",
     "all_text": "🔔 Призыв всем участникам:\n{mentions}",
-    "bonus_claimed": "🎁 {user}, вы забрали ежедневный бонус уважения!",
+    "bonus_claimed": "🎁 {user}, вы забрали ежедневный бонус уважения: +{bonus}!",
     "bonus_cooldown": "⏳ {user}, бонус уже был получен сегодня. Попробуйте позже.",
     "respect_given": "✅ Уважение оказано: {target}\n{scale}",
     "respect_taken": "➖ Уважение уменьшено: {target}\n{scale}",
     "respect_self": "Нельзя изменять уважение самому себе.",
     "reply_required": "Эту команду нужно отправлять ответом на сообщение пользователя.",
     "level_up": "🏆 {user} достиг {level} уровня уважения!",
+    "ping": "pong",
+    "vote_cooldown": "⏳ {user}, команда {command} на перезарядке. Подождите ещё {minutes} мин.",
 }
 
 
@@ -59,6 +62,16 @@ class RespectStorage:
                 )
                 """
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vote_cooldowns (
+                    chat_id INTEGER NOT NULL,
+                    actor_user_id INTEGER NOT NULL,
+                    last_used_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, actor_user_id)
+                )
+                """
+            )
 
     def ensure_user(self, chat_id: int, user_id: int, username: str) -> None:
         with self.conn:
@@ -79,17 +92,17 @@ class RespectStorage:
         if row is None:
             raise ValueError("User not found")
         level = calculate_level(row["respect"])
-        return UserRespect(row["user_id"], row["username"], row["respect"], level)
+        return UserRespect(row["user_id"], row["username"], int(row["respect"]), level)
 
     def update_respect(self, chat_id: int, user_id: int, delta: int) -> UserRespect:
         with self.conn:
             self.conn.execute(
-                "UPDATE users SET respect = MAX(1, respect + ?) WHERE chat_id=? AND user_id=?",
-                (delta, chat_id, user_id),
+                "UPDATE users SET respect = MAX(1, CAST(respect AS INTEGER) + ?) WHERE chat_id=? AND user_id=?",
+                (int(delta), chat_id, user_id),
             )
         return self.get_user(chat_id, user_id)
 
-    def claim_bonus(self, chat_id: int, user_id: int, date_str: str) -> tuple[bool, UserRespect]:
+    def claim_bonus(self, chat_id: int, user_id: int, date_str: str, bonus_amount: int) -> tuple[bool, UserRespect]:
         row = self.conn.execute(
             "SELECT last_bonus_date FROM users WHERE chat_id=? AND user_id=?",
             (chat_id, user_id),
@@ -102,10 +115,32 @@ class RespectStorage:
 
         with self.conn:
             self.conn.execute(
-                "UPDATE users SET respect = respect + 1, last_bonus_date=? WHERE chat_id=? AND user_id=?",
-                (date_str, chat_id, user_id),
+                "UPDATE users SET respect = CAST(respect AS INTEGER) + ?, last_bonus_date=? WHERE chat_id=? AND user_id=?",
+                (int(bonus_amount), date_str, chat_id, user_id),
             )
         return True, self.get_user(chat_id, user_id)
+
+    def get_vote_cooldown_until(self, chat_id: int, actor_user_id: int) -> datetime | None:
+        row = self.conn.execute(
+            "SELECT last_used_at FROM vote_cooldowns WHERE chat_id=? AND actor_user_id=?",
+            (chat_id, actor_user_id),
+        ).fetchone()
+        if row is None:
+            return None
+
+        last_used = datetime.fromisoformat(row["last_used_at"])
+        return last_used + timedelta(hours=1)
+
+    def set_vote_used_now(self, chat_id: int, actor_user_id: int, now: datetime) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO vote_cooldowns (chat_id, actor_user_id, last_used_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, actor_user_id) DO UPDATE SET last_used_at=excluded.last_used_at
+                """,
+                (chat_id, actor_user_id, now.isoformat()),
+            )
 
     def list_mentions(self, chat_id: int, except_user_id: int) -> list[str]:
         rows = self.conn.execute(
@@ -188,6 +223,10 @@ async def handle_message(update: "Update", context: "ContextTypes.DEFAULT_TYPE")
     if not text:
         return
 
+    if text in {"ping", ".ping"}:
+        await message.reply_text(phrases["ping"])
+        return
+
     if text == ".all":
         mentions = storage.list_mentions(message.chat.id, message.from_user.id)
         if not mentions:
@@ -202,12 +241,13 @@ async def handle_message(update: "Update", context: "ContextTypes.DEFAULT_TYPE")
 
     if text == ".bonus":
         today = datetime.now(timezone.utc).date().isoformat()
-        claimed, user_info = storage.claim_bonus(message.chat.id, message.from_user.id, today)
+        bonus_amount = random.randint(5, 20)
+        claimed, user_info = storage.claim_bonus(message.chat.id, message.from_user.id, today, bonus_amount)
         scale = build_scale(user_info.respect)
         if claimed:
-            response = phrases["bonus_claimed"].format(user=author)
+            response = phrases["bonus_claimed"].format(user=author, bonus=bonus_amount)
             await message.reply_text(f"{response}\n{scale}", parse_mode="Markdown")
-            prev_level = calculate_level(user_info.respect - 1)
+            prev_level = calculate_level(max(1, user_info.respect - bonus_amount))
             if user_info.level > prev_level:
                 await message.reply_text(
                     phrases["level_up"].format(user=author, level=user_info.level)
@@ -232,9 +272,19 @@ async def handle_message(update: "Update", context: "ContextTypes.DEFAULT_TYPE")
             await message.reply_text(phrases["respect_self"])
             return
 
+        now = datetime.now(timezone.utc)
+        cooldown_until = storage.get_vote_cooldown_until(message.chat.id, message.from_user.id)
+        if cooldown_until is not None and now < cooldown_until:
+            minutes_left = int((cooldown_until - now).total_seconds() // 60) + 1
+            await message.reply_text(
+                phrases["vote_cooldown"].format(user=author, command=text, minutes=minutes_left)
+            )
+            return
+
         delta = 1 if text == "+" else -1
         prev = storage.get_user(message.chat.id, target_user.id)
         updated = storage.update_respect(message.chat.id, target_user.id, delta)
+        storage.set_vote_used_now(message.chat.id, message.from_user.id, now)
 
         scale = build_scale(updated.respect)
         template_key = "respect_given" if delta > 0 else "respect_taken"
