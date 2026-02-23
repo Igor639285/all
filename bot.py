@@ -1,14 +1,16 @@
-import asyncio
+from __future__ import annotations
+
+import importlib.util
 import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 
-from telegram import Message, Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+if TYPE_CHECKING:
+    from telegram import Message, Update
+    from telegram.ext import ContextTypes
 
 
 DB_PATH = Path("respect.db")
@@ -168,7 +170,7 @@ def extract_username(message: Message) -> str:
     return full_name if full_name else str(user.id)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_message(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
     message = update.effective_message
     if message is None or message.from_user is None or message.chat is None:
         return
@@ -193,7 +195,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         await message.reply_text(
             phrases["all_text"].format(mentions=" ".join(mentions)),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode="Markdown",
             disable_web_page_preview=True,
         )
         return
@@ -204,7 +206,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         scale = build_scale(user_info.respect)
         if claimed:
             response = phrases["bonus_claimed"].format(user=author)
-            await message.reply_text(f"{response}\n{scale}", parse_mode=ParseMode.MARKDOWN)
+            await message.reply_text(f"{response}\n{scale}", parse_mode="Markdown")
             prev_level = calculate_level(user_info.respect - 1)
             if user_info.level > prev_level:
                 await message.reply_text(
@@ -212,7 +214,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
         else:
             response = phrases["bonus_cooldown"].format(user=author)
-            await message.reply_text(f"{response}\n{scale}", parse_mode=ParseMode.MARKDOWN)
+            await message.reply_text(f"{response}\n{scale}", parse_mode="Markdown")
         return
 
     if text in {"+", "-"}:
@@ -238,7 +240,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         template_key = "respect_given" if delta > 0 else "respect_taken"
         await message.reply_text(
             phrases[template_key].format(target=target_author, scale=scale),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode="Markdown",
         )
 
         if updated.level > prev.level:
@@ -258,6 +260,15 @@ def ensure_config_files() -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ensure_config_files()
+
+    if importlib.util.find_spec("telegram") is None:
+        raise RuntimeError(
+            "Не найден пакет 'python-telegram-bot'. Установите зависимости командой: "
+            "pip install -r requirements.txt"
+        )
+
+    from telegram import Update
+    from telegram.ext import Application, MessageHandler, filters
 
     token = load_token(TOKEN_PATH)
     if token == "PASTE_TELEGRAM_BOT_TOKEN_HERE":

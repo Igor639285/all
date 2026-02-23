@@ -46,3 +46,17 @@ python bot.py
 ## Примечание
 
 Команда `.all` упоминает только пользователей, которых бот уже видел в сообщениях группы.
+
+## Ошибка `ModuleNotFoundError: No module named telegram`
+
+Если видите такую ошибку, установите зависимости:
+
+```bash
+pip install -r requirements.txt
+```
+
+После этого снова запустите:
+
+```bash
+python bot.py
+```
