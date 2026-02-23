@@ -142,12 +142,12 @@ class RespectStorage:
                 (chat_id, actor_user_id, now.isoformat()),
             )
 
-    def list_mentions(self, chat_id: int, except_user_id: int) -> list[str]:
+    def list_known_users(self, chat_id: int, except_user_id: int) -> dict[int, str]:
         rows = self.conn.execute(
             "SELECT user_id, username FROM users WHERE chat_id=? AND user_id!=? ORDER BY username",
             (chat_id, except_user_id),
         ).fetchall()
-        return [f"[{r['username']}](tg://user?id={r['user_id']})" for r in rows]
+        return {int(r["user_id"]): str(r["username"]) for r in rows}
 
 
 def calculate_level(respect: int) -> int:
@@ -228,7 +228,19 @@ async def handle_message(update: "Update", context: "ContextTypes.DEFAULT_TYPE")
         return
 
     if text == ".all":
-        mentions = storage.list_mentions(message.chat.id, message.from_user.id)
+        known_users = storage.list_known_users(message.chat.id, message.from_user.id)
+
+        try:
+            admins = await context.bot.get_chat_administrators(message.chat.id)
+            for admin in admins:
+                if admin.user.id == message.from_user.id:
+                    continue
+                admin_name = f"@{admin.user.username}" if admin.user.username else (admin.user.full_name or str(admin.user.id))
+                known_users.setdefault(admin.user.id, admin_name)
+        except Exception as err:
+            logging.warning("Не удалось загрузить администраторов чата для .all: %s", err)
+
+        mentions = [f"[{name}](tg://user?id={uid})" for uid, name in sorted(known_users.items(), key=lambda item: item[1].lower())]
         if not mentions:
             await message.reply_text(phrases["all_empty"])
             return
