@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 DB_PATH = Path("respect.db")
 TOKEN_PATH = Path("token.txt")
 MESSAGES_PATH = Path("messages.txt")
+CUSTOM_COMMANDS_PATH = Path("commands.txt")
 
 
 DEFAULT_MESSAGES = {
@@ -30,7 +31,7 @@ DEFAULT_MESSAGES = {
     "reply_required": "Эту команду нужно отправлять ответом на сообщение пользователя.",
     "level_up": "🏆 {user} достиг {level} уровня уважения!",
     "ping": "pong",
-    "vote_cooldown": "⏳ {user}, команда {command} на перезарядке. Подождите ещё {minutes} мин.",
+    "vote_cooldown": "⏳ {user}, для {target} команда {command} на перезарядке. Подождите ещё {minutes} мин.",
     "stats_title": "🏅 Лидеры чата по уважению:",
     "glstats_title": "🌍 Глобальные лидеры по уважению:",
     "stats_empty": "Пока нет данных для отображения статистики.",
@@ -70,11 +71,27 @@ class RespectStorage:
                 CREATE TABLE IF NOT EXISTS vote_cooldowns (
                     chat_id INTEGER NOT NULL,
                     actor_user_id INTEGER NOT NULL,
+                    target_user_id INTEGER NOT NULL,
                     last_used_at TEXT NOT NULL,
-                    PRIMARY KEY (chat_id, actor_user_id)
+                    PRIMARY KEY (chat_id, actor_user_id, target_user_id)
                 )
                 """
             )
+            cols = self.conn.execute("PRAGMA table_info(vote_cooldowns)").fetchall()
+            col_names = {str(c[1]) for c in cols}
+            if "target_user_id" not in col_names:
+                self.conn.execute("DROP TABLE vote_cooldowns")
+                self.conn.execute(
+                    """
+                    CREATE TABLE vote_cooldowns (
+                        chat_id INTEGER NOT NULL,
+                        actor_user_id INTEGER NOT NULL,
+                        target_user_id INTEGER NOT NULL,
+                        last_used_at TEXT NOT NULL,
+                        PRIMARY KEY (chat_id, actor_user_id, target_user_id)
+                    )
+                    """
+                )
 
     def ensure_user(self, chat_id: int, user_id: int, username: str) -> None:
         with self.conn:
@@ -123,26 +140,26 @@ class RespectStorage:
             )
         return True, self.get_user(chat_id, user_id)
 
-    def get_vote_cooldown_until(self, chat_id: int, actor_user_id: int) -> datetime | None:
+    def get_vote_cooldown_until(self, chat_id: int, actor_user_id: int, target_user_id: int) -> datetime | None:
         row = self.conn.execute(
-            "SELECT last_used_at FROM vote_cooldowns WHERE chat_id=? AND actor_user_id=?",
-            (chat_id, actor_user_id),
+            "SELECT last_used_at FROM vote_cooldowns WHERE chat_id=? AND actor_user_id=? AND target_user_id=?",
+            (chat_id, actor_user_id, target_user_id),
         ).fetchone()
         if row is None:
             return None
 
         last_used = datetime.fromisoformat(row["last_used_at"])
-        return last_used + timedelta(hours=1)
+        return last_used + timedelta(minutes=10)
 
-    def set_vote_used_now(self, chat_id: int, actor_user_id: int, now: datetime) -> None:
+    def set_vote_used_now(self, chat_id: int, actor_user_id: int, target_user_id: int, now: datetime) -> None:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO vote_cooldowns (chat_id, actor_user_id, last_used_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(chat_id, actor_user_id) DO UPDATE SET last_used_at=excluded.last_used_at
+                INSERT INTO vote_cooldowns (chat_id, actor_user_id, target_user_id, last_used_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, actor_user_id, target_user_id) DO UPDATE SET last_used_at=excluded.last_used_at
                 """,
-                (chat_id, actor_user_id, now.isoformat()),
+                (chat_id, actor_user_id, target_user_id, now.isoformat()),
             )
 
     def list_known_users(self, chat_id: int, except_user_id: int) -> dict[int, str]:
@@ -226,6 +243,29 @@ def save_messages(path: Path, data: Dict[str, str]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def load_custom_commands(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        path.write_text("# Свои команды: .команда=ответ\n", encoding="utf-8")
+        return {}
+
+    reserved = {".all", ".bonus", ".stats", ".glstats", ".ping", "ping", "+", "-"}
+    commands: Dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        command = key.strip()
+        if not command.startswith("."):
+            command = f".{command}"
+        if command in reserved:
+            continue
+        commands[command] = value.strip().replace("\\n", "\n")
+    return commands
+
+
 def extract_username(message: Message) -> str:
     user = message.from_user
     if user.username:
@@ -244,12 +284,17 @@ async def handle_message(update: "Update", context: "ContextTypes.DEFAULT_TYPE")
 
     storage: RespectStorage = context.application.bot_data["storage"]
     phrases: Dict[str, str] = context.application.bot_data["messages"]
+    custom_commands: Dict[str, str] = context.application.bot_data["custom_commands"]
 
     author = extract_username(message)
     storage.ensure_user(message.chat.id, message.from_user.id, author)
 
     text = (message.text or "").strip()
     if not text:
+        return
+
+    if text in custom_commands:
+        await message.reply_text(custom_commands[text])
         return
 
     if text in {"ping", ".ping"}:
@@ -336,18 +381,18 @@ async def handle_message(update: "Update", context: "ContextTypes.DEFAULT_TYPE")
             return
 
         now = datetime.now(timezone.utc)
-        cooldown_until = storage.get_vote_cooldown_until(message.chat.id, message.from_user.id)
+        cooldown_until = storage.get_vote_cooldown_until(message.chat.id, message.from_user.id, target_user.id)
         if cooldown_until is not None and now < cooldown_until:
             minutes_left = int((cooldown_until - now).total_seconds() // 60) + 1
             await message.reply_text(
-                phrases["vote_cooldown"].format(user=author, command=text, minutes=minutes_left)
+                phrases["vote_cooldown"].format(user=author, target=target_author, command=text, minutes=minutes_left)
             )
             return
 
         delta = 1 if text == "+" else -1
         prev = storage.get_user(message.chat.id, target_user.id)
         updated = storage.update_respect(message.chat.id, target_user.id, delta)
-        storage.set_vote_used_now(message.chat.id, message.from_user.id, now)
+        storage.set_vote_used_now(message.chat.id, message.from_user.id, target_user.id, now)
 
         scale = build_scale(updated.respect)
         template_key = "respect_given" if delta > 0 else "respect_taken"
@@ -369,6 +414,9 @@ def ensure_config_files() -> None:
     if not TOKEN_PATH.exists():
         TOKEN_PATH.write_text("PASTE_TELEGRAM_BOT_TOKEN_HERE\n", encoding="utf-8")
 
+    if not CUSTOM_COMMANDS_PATH.exists():
+        CUSTOM_COMMANDS_PATH.write_text("# Свои команды: .команда=ответ\n", encoding="utf-8")
+
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -387,10 +435,12 @@ def main() -> None:
         return
 
     messages = load_messages(MESSAGES_PATH)
+    custom_commands = load_custom_commands(CUSTOM_COMMANDS_PATH)
     storage = RespectStorage(DB_PATH)
 
     app = Application.builder().token(token).build()
     app.bot_data["messages"] = messages
+    app.bot_data["custom_commands"] = custom_commands
     app.bot_data["storage"] = storage
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
